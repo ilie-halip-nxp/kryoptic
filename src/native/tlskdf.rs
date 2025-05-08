@@ -293,7 +293,7 @@ impl TLSKDFOperation {
         }
 
         match mech.mechanism {
-            CKM_TLS12_MASTER_KEY_DERIVE => Self::new_tls12_mk_derive(mech),
+            CKM_TLS12_MASTER_KEY_DERIVE | CKM_TLS12_MASTER_KEY_DERIVE_DH => Self::new_tls12_mk_derive(mech),
             CKM_TLS12_KEY_AND_MAC_DERIVE | CKM_TLS12_KEY_SAFE_DERIVE => {
                 Self::new_tls12_keymac_derive(mech)
             }
@@ -304,7 +304,8 @@ impl TLSKDFOperation {
         }
     }
 
-    /// Constructor for the `CKM_TLS12_MASTER_KEY_DERIVE` mechanism
+    /// Constructor for `CKM_TLS12_MASTER_KEY_DERIVE` and
+    /// `CKM_TLS12_MASTER_KEY_DERIVE_DH`
     ///
     /// Parses `CK_TLS12_MASTER_KEY_DERIVE_PARAMS`, validates inputs, and sets
     /// up the operation context for deriving the master secret.
@@ -487,7 +488,7 @@ impl TLSKDFOperation {
         match key.get_attr(CKA_VALUE_LEN) {
             Some(a) => match a.to_ulong() {
                 Ok(l) => {
-                    if l != TLS_MASTER_SECRET_SIZE {
+                    if self.mech != CKM_TLS12_MASTER_KEY_DERIVE_DH && l != TLS_MASTER_SECRET_SIZE {
                         return Err(CKR_KEY_FUNCTION_NOT_PERMITTED)?;
                     }
                     Ok(())
@@ -867,7 +868,7 @@ impl Derive for TLSKDFOperation {
         self.finalized = true;
 
         match self.mech {
-            CKM_TLS12_MASTER_KEY_DERIVE => {
+            CKM_TLS12_MASTER_KEY_DERIVE | CKM_TLS12_MASTER_KEY_DERIVE_DH => {
                 self.derive_master_key(key, template, mechanisms, objfactories)
             }
             CKM_TLS12_KEY_AND_MAC_DERIVE | CKM_TLS12_KEY_SAFE_DERIVE => {
