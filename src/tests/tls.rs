@@ -132,6 +132,7 @@ struct TlsKdfTestUnit {
     cli_rnd: Vec<u8>,
     ms: Vec<u8>,
     kb: Vec<u8>,
+    prf: CK_MECHANISM_TYPE
 }
 
 #[derive(Debug)]
@@ -211,6 +212,7 @@ fn parse_kdf_vector(filename: &str) -> Vec<TlsKdfTestSection> {
                 cli_rnd: vec![0u8; 32],
                 ms: vec![0u8; pms_len],
                 kb: vec![0u8; kb_len],
+                prf: section.prf
             };
             section.units.push(unit);
             continue;
@@ -254,6 +256,178 @@ fn parse_kdf_vector(filename: &str) -> Vec<TlsKdfTestSection> {
     data
 }
 
+fn test_tlskdf_unit(session: CK_SESSION_HANDLE, kdf: CK_MECHANISM_TYPE, unit: &TlsKdfTestUnit) {
+    println!("Executing test at line {}", unit.line);
+    /* create key */
+    let key_handle = ret_or_panic!(import_object(
+        session,
+        CKO_SECRET_KEY,
+        &[(CKA_KEY_TYPE, CKK_GENERIC_SECRET)],
+        &[
+            (CKA_VALUE, unit.pms.as_slice()),
+            (
+                CKA_LABEL,
+                format!(
+                    "Key for mech {}, COUNT={}, line {}",
+                    kdf, unit.count, unit.line
+                )
+                .as_bytes()
+            )
+        ],
+        &[(CKA_DERIVE, true)],
+    ));
+
+    /* Master key Derivation */
+
+    let derive_template = make_attr_template(
+        &[
+            (CKA_CLASS, CKO_SECRET_KEY),
+            (CKA_KEY_TYPE, CKK_GENERIC_SECRET),
+            (CKA_VALUE_LEN, unit.ms.len() as CK_ULONG),
+        ],
+        &[],
+        &[(CKA_SENSITIVE, false), (CKA_EXTRACTABLE, true)],
+    );
+
+    let (params, paramslen) = match kdf {
+        CKM_TLS12_MASTER_KEY_DERIVE | CKM_TLS12_MASTER_KEY_DERIVE_DH => (
+            CK_TLS12_MASTER_KEY_DERIVE_PARAMS {
+                RandomInfo: CK_SSL3_RANDOM_DATA {
+                    pClientRandom: byte_ptr!(unit.cli_hlo_rnd.as_ptr()),
+                    ulClientRandomLen: unit.cli_hlo_rnd.len()
+                        as CK_ULONG,
+                    pServerRandom: byte_ptr!(unit.srv_hlo_rnd.as_ptr()),
+                    ulServerRandomLen: unit.srv_hlo_rnd.len()
+                        as CK_ULONG,
+                },
+                pVersion: std::ptr::null_mut(),
+                prfHashMechanism: unit.prf,
+            },
+            sizeof!(CK_TLS12_MASTER_KEY_DERIVE_PARAMS),
+        ),
+        _ => panic!("Invalid mechanism"),
+    };
+    let derive_mech = CK_MECHANISM {
+        mechanism: kdf,
+        pParameter: void_ptr!(&params),
+        ulParameterLen: paramslen,
+    };
+
+    let mut dk_handle = CK_INVALID_HANDLE;
+    let ret = fn_derive_key(
+        session,
+        &derive_mech as *const _ as CK_MECHANISM_PTR,
+        key_handle,
+        derive_template.as_ptr() as *mut _,
+        derive_template.len() as CK_ULONG,
+        &mut dk_handle,
+    );
+    if ret != CKR_OK {
+        panic!("Failed ({}) unit test at line {}", ret, unit.line);
+    }
+
+    let value = ret_or_panic!(extract_key_value(
+        session,
+        dk_handle,
+        unit.ms.len()
+    ));
+    if value != unit.ms {
+        panic!("Failed ({}) unit test {} at line {} - values differ [{} != {}]",
+                ret, unit.count, unit.line, hex::encode(value), hex::encode(unit.ms.clone()));
+    }
+
+    /* Key Expansion */
+
+    /* mac keys can't be extracted, so assume keys of 48 bytes and
+     * put the rest as ivs which are returned */
+
+    let half = unit.kb.len() / 2;
+    let keylen = if half < 48 { half } else { 48 };
+    let ivlen = half - keylen;
+
+    let derive_template = make_attr_template(
+        &[
+            (CKA_CLASS, CKO_SECRET_KEY),
+            (CKA_KEY_TYPE, CKK_GENERIC_SECRET),
+            (CKA_VALUE_LEN, keylen as CK_ULONG),
+        ],
+        &[],
+        &[(CKA_SENSITIVE, false), (CKA_EXTRACTABLE, true)],
+    );
+
+    let mut cliiv = vec![0u8; ivlen];
+    let mut srviv = vec![0u8; ivlen];
+    let mut mat_out = CK_SSL3_KEY_MAT_OUT {
+        hClientMacSecret: CK_INVALID_HANDLE,
+        hServerMacSecret: CK_INVALID_HANDLE,
+        hClientKey: CK_INVALID_HANDLE,
+        hServerKey: CK_INVALID_HANDLE,
+        pIVClient: cliiv.as_mut_ptr(),
+        pIVServer: srviv.as_mut_ptr(),
+    };
+
+    let (kdf, params, paramslen) = match kdf {
+        CKM_TLS12_MASTER_KEY_DERIVE | CKM_TLS12_MASTER_KEY_DERIVE_DH => (
+            CKM_TLS12_KEY_AND_MAC_DERIVE,
+            CK_TLS12_KEY_MAT_PARAMS {
+                ulMacSizeInBits: 0,
+                ulKeySizeInBits: (keylen as CK_ULONG) * 8,
+                ulIVSizeInBits: (ivlen as CK_ULONG) * 8,
+                bIsExport: CK_FALSE,
+                RandomInfo: CK_SSL3_RANDOM_DATA {
+                    pClientRandom: byte_ptr!(unit.cli_rnd.as_ptr()),
+                    ulClientRandomLen: unit.cli_rnd.len() as CK_ULONG,
+                    pServerRandom: byte_ptr!(unit.srv_rnd.as_ptr()),
+                    ulServerRandomLen: unit.srv_rnd.len() as CK_ULONG,
+                },
+                pReturnedKeyMaterial: &mut mat_out,
+                prfHashMechanism: unit.prf,
+            },
+            sizeof!(CK_TLS12_KEY_MAT_PARAMS),
+        ),
+        _ => panic!("Invalid mechanism"),
+    };
+    let derive_mech = CK_MECHANISM {
+        mechanism: kdf,
+        pParameter: void_ptr!(&params),
+        ulParameterLen: paramslen,
+    };
+
+    let ret = fn_derive_key(
+        session,
+        &derive_mech as *const _ as CK_MECHANISM_PTR,
+        dk_handle,
+        derive_template.as_ptr() as *mut _,
+        derive_template.len() as CK_ULONG,
+        std::ptr::null_mut(),
+    );
+    if ret != CKR_OK {
+        panic!("Failed ({}) unit test at line {}", ret, unit.line);
+    }
+
+    let clikeyval = ret_or_panic!(extract_key_value(
+        session,
+        mat_out.hClientKey,
+        keylen
+    ));
+    let srvkeyval = ret_or_panic!(extract_key_value(
+        session,
+        mat_out.hServerKey,
+        keylen
+    ));
+
+    let mut value = Vec::<u8>::with_capacity(unit.kb.len());
+    value.extend_from_slice(clikeyval.as_slice());
+    value.extend_from_slice(srvkeyval.as_slice());
+    value.extend_from_slice(cliiv.as_slice());
+    value.extend_from_slice(srviv.as_slice());
+
+    if value != unit.kb {
+        panic!("Failed ({}) unit test {} at line {} - values differ [{} != {}]",
+                ret, unit.count, unit.line, hex::encode(value), hex::encode(unit.kb.clone()));
+    }
+}
+
 fn test_tlskdf_units(
     session: CK_SESSION_HANDLE,
     test_data: Vec<TlsKdfTestSection>,
@@ -265,175 +439,11 @@ fn test_tlskdf_units(
         }
 
         for unit in section.units {
-            println!("Executing test at line {}", unit.line);
-            /* create key */
-            let key_handle = ret_or_panic!(import_object(
-                session,
-                CKO_SECRET_KEY,
-                &[(CKA_KEY_TYPE, CKK_GENERIC_SECRET)],
-                &[
-                    (CKA_VALUE, unit.pms.as_slice()),
-                    (
-                        CKA_LABEL,
-                        format!(
-                            "Key for mech {}, COUNT={}, line {}",
-                            section.kdf, unit.count, unit.line
-                        )
-                        .as_bytes()
-                    )
-                ],
-                &[(CKA_DERIVE, true)],
-            ));
-
-            /* Master key Derivation */
-
-            let derive_template = make_attr_template(
-                &[
-                    (CKA_CLASS, CKO_SECRET_KEY),
-                    (CKA_KEY_TYPE, CKK_GENERIC_SECRET),
-                    (CKA_VALUE_LEN, unit.ms.len() as CK_ULONG),
-                ],
-                &[],
-                &[(CKA_SENSITIVE, false), (CKA_EXTRACTABLE, true)],
-            );
-
-            let (params, paramslen) = match section.kdf {
-                CKM_TLS12_MASTER_KEY_DERIVE => (
-                    CK_TLS12_MASTER_KEY_DERIVE_PARAMS {
-                        RandomInfo: CK_SSL3_RANDOM_DATA {
-                            pClientRandom: byte_ptr!(unit.cli_hlo_rnd.as_ptr()),
-                            ulClientRandomLen: unit.cli_hlo_rnd.len()
-                                as CK_ULONG,
-                            pServerRandom: byte_ptr!(unit.srv_hlo_rnd.as_ptr()),
-                            ulServerRandomLen: unit.srv_hlo_rnd.len()
-                                as CK_ULONG,
-                        },
-                        pVersion: std::ptr::null_mut(),
-                        prfHashMechanism: section.prf,
-                    },
-                    sizeof!(CK_TLS12_MASTER_KEY_DERIVE_PARAMS),
-                ),
-                _ => panic!("Invalid mechanism"),
-            };
-            let derive_mech = CK_MECHANISM {
-                mechanism: section.kdf,
-                pParameter: void_ptr!(&params),
-                ulParameterLen: paramslen,
-            };
-
-            let mut dk_handle = CK_INVALID_HANDLE;
-            let ret = fn_derive_key(
-                session,
-                &derive_mech as *const _ as CK_MECHANISM_PTR,
-                key_handle,
-                derive_template.as_ptr() as *mut _,
-                derive_template.len() as CK_ULONG,
-                &mut dk_handle,
-            );
-            if ret != CKR_OK {
-                panic!("Failed ({}) unit test at line {}", ret, unit.line);
-            }
-
-            let value = ret_or_panic!(extract_key_value(
-                session,
-                dk_handle,
-                unit.ms.len()
-            ));
-            if value != unit.ms {
-                panic!("Failed ({}) unit test {} at line {} - values differ [{} != {}]",
-                       ret, unit.count, unit.line, hex::encode(value), hex::encode(unit.ms));
-            }
-
-            /* Key Expansion */
-
-            /* mac keys can't be extracted, so assume keys of 48 bytes and
-             * put the rest as ivs which are returned */
-
-            let half = unit.kb.len() / 2;
-            let keylen = if half < 48 { half } else { 48 };
-            let ivlen = half - keylen;
-
-            let derive_template = make_attr_template(
-                &[
-                    (CKA_CLASS, CKO_SECRET_KEY),
-                    (CKA_KEY_TYPE, CKK_GENERIC_SECRET),
-                    (CKA_VALUE_LEN, keylen as CK_ULONG),
-                ],
-                &[],
-                &[(CKA_SENSITIVE, false), (CKA_EXTRACTABLE, true)],
-            );
-
-            let mut cliiv = vec![0u8; ivlen];
-            let mut srviv = vec![0u8; ivlen];
-            let mut mat_out = CK_SSL3_KEY_MAT_OUT {
-                hClientMacSecret: CK_INVALID_HANDLE,
-                hServerMacSecret: CK_INVALID_HANDLE,
-                hClientKey: CK_INVALID_HANDLE,
-                hServerKey: CK_INVALID_HANDLE,
-                pIVClient: cliiv.as_mut_ptr(),
-                pIVServer: srviv.as_mut_ptr(),
-            };
-
-            let (kdf, params, paramslen) = match section.kdf {
-                CKM_TLS12_MASTER_KEY_DERIVE => (
-                    CKM_TLS12_KEY_AND_MAC_DERIVE,
-                    CK_TLS12_KEY_MAT_PARAMS {
-                        ulMacSizeInBits: 0,
-                        ulKeySizeInBits: (keylen as CK_ULONG) * 8,
-                        ulIVSizeInBits: (ivlen as CK_ULONG) * 8,
-                        bIsExport: CK_FALSE,
-                        RandomInfo: CK_SSL3_RANDOM_DATA {
-                            pClientRandom: byte_ptr!(unit.cli_rnd.as_ptr()),
-                            ulClientRandomLen: unit.cli_rnd.len() as CK_ULONG,
-                            pServerRandom: byte_ptr!(unit.srv_rnd.as_ptr()),
-                            ulServerRandomLen: unit.srv_rnd.len() as CK_ULONG,
-                        },
-                        pReturnedKeyMaterial: &mut mat_out,
-                        prfHashMechanism: section.prf,
-                    },
-                    sizeof!(CK_TLS12_KEY_MAT_PARAMS),
-                ),
-                _ => panic!("Invalid mechanism"),
-            };
-            let derive_mech = CK_MECHANISM {
-                mechanism: kdf,
-                pParameter: void_ptr!(&params),
-                ulParameterLen: paramslen,
-            };
-
-            let ret = fn_derive_key(
-                session,
-                &derive_mech as *const _ as CK_MECHANISM_PTR,
-                dk_handle,
-                derive_template.as_ptr() as *mut _,
-                derive_template.len() as CK_ULONG,
-                std::ptr::null_mut(),
-            );
-            if ret != CKR_OK {
-                panic!("Failed ({}) unit test at line {}", ret, unit.line);
-            }
-
-            let clikeyval = ret_or_panic!(extract_key_value(
-                session,
-                mat_out.hClientKey,
-                keylen
-            ));
-            let srvkeyval = ret_or_panic!(extract_key_value(
-                session,
-                mat_out.hServerKey,
-                keylen
-            ));
-
-            let mut value = Vec::<u8>::with_capacity(unit.kb.len());
-            value.extend_from_slice(clikeyval.as_slice());
-            value.extend_from_slice(srvkeyval.as_slice());
-            value.extend_from_slice(cliiv.as_slice());
-            value.extend_from_slice(srviv.as_slice());
-
-            if value != unit.kb {
-                panic!("Failed ({}) unit test {} at line {} - values differ [{} != {}]",
-                       ret, unit.count, unit.line, hex::encode(value), hex::encode(unit.kb));
-            }
+            /* When running with kdf == CKM_TLS12_MASTER_KEY_DERIVE, run
+             * the same tests also with CKM_TLS12_MASTER_KEY_DERIVE_DH since the
+             * two mechanisms are functionally identical */
+            test_tlskdf_unit(session, CKM_TLS12_MASTER_KEY_DERIVE, &unit);
+            test_tlskdf_unit(session, CKM_TLS12_MASTER_KEY_DERIVE_DH, &unit);
         }
     }
 }
